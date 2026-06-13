@@ -42,6 +42,16 @@ function toast(msg){ const t=$('#toast'); t.textContent=msg; t.classList.add('sh
 function playerKey(){ const email=$('#playerEmail').value.trim().toLowerCase(); const name=$('#playerName').value.trim(); return email || name.toLowerCase(); }
 function ensurePlayer(){ const name=$('#playerName').value.trim(); if(!name) throw new Error('Skriv ditt namn först.'); const id=playerKey(); const existing=state.players.find(p=>p.id===id); if(existing){ existing.name=name; existing.email=$('#playerEmail').value.trim(); } else state.players.push({id,name,email:$('#playerEmail').value.trim(),created_at:new Date().toISOString()}); return id; }
 function outcome(h,a){ if(h===''||a===''||h==null||a==null) return ''; h=Number(h); a=Number(a); return h>a?'1':h<a?'2':'X'; }
+
+function kickoffDate(m){
+  // Matchtiderna i MATCHES är svensk tid i formatet YYYY-MM-DD HH:mm
+  return new Date(m.date.replace(' ', 'T') + ':00');
+}
+
+function isLocked(m){
+  const r = state.results[m.id];
+  return new Date() >= kickoffDate(m) || r?.status === 'Complete';
+}
 function norm(s){ return (s||'').trim().toLowerCase(); }
 function apiEnabled(){ return API_URL && API_URL.startsWith('http'); }
 async function api(action,payload={}){
@@ -79,12 +89,45 @@ function predictionInputs(prefix,m,vals={}){
   </div>`;
 }
 function matchRow(m,admin){
-  const r=state.results[m.id]||{}; const div=document.createElement('div'); div.className=admin?'match-row admin-row':'match-row';
-  div.innerHTML=`<div><div class="date">${m.date}</div><div class="result-pill">Grupp ${m.group}</div></div><div class="teams">${m.home} – ${m.away}</div>`;
+  const r=state.results[m.id]||{};
+  const locked=isLocked(m);
+  const div=document.createElement('div');
+  div.className=admin?'match-row admin-row':'match-row';
+
+  div.innerHTML=`<div>
+    <div class="date">${m.date}</div>
+    <div class="result-pill">Grupp ${m.group}</div>
+  </div>
+  <div class="teams">${m.home} – ${m.away}</div>`;
+
   if(admin){
-    div.innerHTML += `${predictionInputs('r',m,{home:r.home_score,away:r.away_score})}<select data-status="${m.id}"><option value="Scheduled" ${r.status!=='Complete'?'selected':''}>Ej spelad</option><option value="Complete" ${r.status==='Complete'?'selected':''}>Spelad</option></select><span class="result-pill">${r.status==='Complete'?'Poäng räknas':'Poäng räknas ej'}</span>`;
+    div.innerHTML += `${predictionInputs('r',m,{home:r.home_score,away:r.away_score})}
+    <select data-status="${m.id}">
+      <option value="Scheduled" ${r.status!=='Complete'?'selected':''}>Ej spelad</option>
+      <option value="Complete" ${r.status==='Complete'?'selected':''}>Spelad</option>
+    </select>
+    <span class="result-pill">${r.status==='Complete'?'Poäng räknas':'Poäng räknas ej'}</span>`;
   } else {
-    div.innerHTML += `<label>1/X/2<select class="tip-select" data-tip="${m.id}"><option value="">Välj</option><option value="1">1 - ${m.home}</option><option value="X">X - oavgjort</option><option value="2">2 - ${m.away}</option></select></label>${predictionInputs('p',m)}<span class="result-pill ${r.status==='Complete'?'played':''}">Resultat: ${r.status==='Complete'?`${r.home_score}–${r.away_score}`:'ej spelad'}</span>`;
+    div.innerHTML += `
+    <label>1/X/2
+      <select class="tip-select" data-tip="${m.id}" ${locked?'disabled':''}>
+        <option value="">Välj</option>
+        <option value="1">1 - ${m.home}</option>
+        <option value="X">X - oavgjort</option>
+        <option value="2">2 - ${m.away}</option>
+      </select>
+    </label>
+    ${predictionInputs('p',m)}
+    <span class="result-pill ${locked?'locked':''} ${r.status==='Complete'?'played':''}">
+      ${r.status==='Complete'
+        ? `Resultat: ${r.home_score}–${r.away_score}`
+        : locked ? 'Låst – matchen har startat' : 'Öppen'}
+    </span>`;
+
+    setTimeout(()=>{
+      document.querySelectorAll(`[data-ph="${m.id}"], [data-pa="${m.id}"]`)
+        .forEach(x=>x.disabled=locked);
+    },0);
   }
   return div;
 }
@@ -138,7 +181,45 @@ async function fetchResults(){
 }
 
 document.querySelectorAll('.tab').forEach(btn=>btn.onclick=()=>{ document.querySelectorAll('.tab,.view').forEach(x=>x.classList.remove('active')); btn.classList.add('active'); $('#'+btn.dataset.view).classList.add('active'); renderAll(); });
-$('#savePredictions').onclick=async()=>{ try{ const pid=ensurePlayer(); state.predictions=state.predictions.filter(p=>p.player_id!==pid); MATCHES.forEach(m=>{ const tip=document.querySelector(`[data-tip="${m.id}"]`).value; const ph=document.querySelector(`[data-ph="${m.id}"]`).value; const pa=document.querySelector(`[data-pa="${m.id}"]`).value; if(tip || ph!=='' || pa!=='') state.predictions.push({player_id:pid,match_id:m.id,tip_1x2:tip,pred_home:ph,pred_away:pa,submitted_at:new Date().toISOString()}); }); saveLocal(); await saveCloud(); renderScoreboard(); toast('Tips sparade!'); }catch(e){toast(e.message)} };
+$('#savePredictions').onclick=async()=>{
+  try{
+    const pid=ensurePlayer();
+
+    // Behåll gamla tips för låsta matcher. De får inte skrivas över efter avspark.
+    const lockedPredictions = state.predictions.filter(p=>{
+      const m = MATCHES.find(x=>x.id===p.match_id);
+      return p.player_id===pid && m && isLocked(m);
+    });
+
+    // Ta bort spelarens gamla tips och lägg tillbaka låsta tips.
+    state.predictions = state.predictions.filter(p=>p.player_id!==pid);
+    state.predictions.push(...lockedPredictions);
+
+    // Spara bara tips för öppna matcher.
+    MATCHES.forEach(m=>{
+      if(isLocked(m)) return;
+      const tip=document.querySelector(`[data-tip="${m.id}"]`).value;
+      const ph=document.querySelector(`[data-ph="${m.id}"]`).value;
+      const pa=document.querySelector(`[data-pa="${m.id}"]`).value;
+      if(tip || ph!=='' || pa!=='') {
+        state.predictions.push({
+          player_id:pid,
+          match_id:m.id,
+          tip_1x2:tip,
+          pred_home:ph,
+          pred_away:pa,
+          submitted_at:new Date().toISOString()
+        });
+      }
+    });
+
+    saveLocal();
+    await saveCloud();
+    renderScoreboard();
+    renderMatches();
+    toast('Tips sparade! Låsta matcher ändrades inte.');
+  }catch(e){toast(e.message)}
+};
 $('#saveBonus').onclick=async()=>{ try{ const pid=ensurePlayer(); state.bonus=state.bonus.filter(b=>b.player_id!==pid); state.bonus.push({player_id:pid,finalist1:$('#finalist1').value,finalist2:$('#finalist2').value,topScorer:$('#topScorer').value}); saveLocal(); await saveCloud(); renderScoreboard(); toast('Bonus sparad!'); }catch(e){toast(e.message)} };
 $('#saveResults').onclick=async()=>{ MATCHES.forEach(m=>{ const hs=document.querySelector(`[data-rh="${m.id}"]`).value; const as=document.querySelector(`[data-ra="${m.id}"]`).value; const status=document.querySelector(`[data-status="${m.id}"]`).value; state.results[m.id]={home_score:hs,away_score:as,status}; }); saveLocal(); await saveCloud(); renderAll(); toast('Resultat sparade!'); };
 $('#saveActualBonus').onclick=async()=>{ state.actualBonus={finalist1:$('#actualFinalist1').value,finalist2:$('#actualFinalist2').value,topScorer:$('#actualTopScorer').value}; saveLocal(); await saveCloud(); renderScoreboard(); toast('Faktisk bonus sparad!'); };
